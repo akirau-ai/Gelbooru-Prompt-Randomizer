@@ -1,0 +1,179 @@
+*** a/GelbooruPromptRandomizer.py
+--- b/GelbooruPromptRandomizer.py
+@@
+-import contextlib
+-
+-import gradio as gr
+-from modules import scripts, shared, script_callbacks
+-
+-from scripts.Gel import Gelbooru
++import contextlib
++import os
++import io
++import time
++import gradio as gr
++from modules import scripts, shared, script_callbacks
++from scripts.Gel import Gelbooru
+@@
+ async def get_random_tags(include, exclude):
+     include = include.replace(" ", "")
+     exclude = exclude.replace(" ", "")
+@@
+-    tags = gel_post.get_tags()
+-    for id in range(len(tags)):
+-        if(tags[id] not in getattr(shared.opts, "gpr_undersocreReplacementExclusionList").split(',')):
+-            tags[id] = tags[id].replace("_", " ")
++    tags = gel_post.get_tags()
++    # --- removal filter (TXT-based) ---
++    tags = _apply_removal_filter(tags)
++    # --- pretty print (underscore -> space except exclusion list) ---
++    for id in range(len(tags)):
++        if(tags[id] not in getattr(shared.opts, "gpr_undersocreReplacementExclusionList").split(',')):
++            tags[id] = tags[id].replace("_", " ")
+@@
+     return ', '.join(tags), gel_post.file_url, str(gel_post)
+ 
+ class GPRScript(scripts.Script):
+@@
+     def ui(self, is_img2img):
+         with gr.Accordion('Gelbooru Prompt Randomizer', open=False):
+             with gr.Column():
+                 include_tags_textbox = gr.Textbox(label='Include Tags', placeholder="es: 1girl, blue_hair, solo")
+                 exclude_tags_textbox = gr.Textbox(label='Exclude Tags', placeholder="es: nsfw, text, watermark")
++
++                # ----- Removal List (TXT-backed) -----
++                with gr.Group():
++                    removal_textbox = gr.Textbox(
++                        label="Removal List (1 tag per line, lines starting with # are comments)",
++                        value=_ui_load_removal_text(),  # 初期表示時にファイル内容を読み込み
++                        lines=8
++                    )
++                    with gr.Row():
++                        removal_save_btn = gr.Button(value='Save Removal List', variant='primary', size='sm')
++                        removal_reload_btn = gr.Button(value='Reload', size='sm')
+ 
+                 with gr.Row():
+                     send_text_button = gr.Button(value='Randomize', variant='primary', size='sm')
+                     clear_button = gr.Button(value='Clear', size='sm')
+@@
+                 url_textbox = gr.Textbox(label='Post URL', show_copy_button=True, interactive=False)
+ 
+         with contextlib.suppress(AttributeError):
++            # Removal list Save/Reload
++            removal_save_btn.click(
++                fn=_ui_save_removal_text,
++                inputs=[removal_textbox],
++                outputs=[removal_textbox],
++            )
++            removal_reload_btn.click(
++                fn=_ui_reload_removal_text,
++                inputs=None,
++                outputs=[removal_textbox],
++            )
++
+             replace_tags_button.click(fn=lambda result_tags:(result_tags), inputs=result_tags_textbox, outputs=self.text2img if not is_img2img else self.img2img)
+             append_tags_button.click(fn=lambda result_tags, tags:(f"{tags}, {result_tags}"), inputs=[result_tags_textbox, self.text2img if not is_img2img else self.img2img], outputs=self.text2img if not is_img2img else self.img2img)
+             send_text_button.click(fn=get_random_tags, inputs=[include_tags_textbox, exclude_tags_textbox], outputs=[result_tags_textbox, preview_image, url_textbox])
+             clear_button.click(fn=lambda:(None, None, None), inputs=None, outputs=[preview_image, url_textbox, result_tags_textbox])
+@@
+     def on_ui_settings():
+         GPR_SECTION = ("gpr", "Gelbooru Prompt Randomizer")
+@@
+         for key, opt, in gpr_options.items():
+             opt.section = GPR_SECTION
+             shared.opts.add_option(key, opt)
+ 
+     script_callbacks.on_ui_settings(on_ui_settings)
+@@
+         if kwargs.get("elem_id") == "img2img_prompt":
+             self.img2img = component
++
++# =========================================================
++# Removal list: file-backed helpers (extensions-local)
++# =========================================================
++_REMOVAL_CACHE = {"mtime": None, "set": set()}
++
++def _removal_file_path() -> str:
++    # 拡張ディレクトリ直下に固定保存
++    base_dir = os.path.dirname(__file__)
++    return os.path.join(base_dir, "removal_tags.txt")
++
++def _normalize_tag(s: str) -> str:
++    # 比較用正規化：trim -> lower -> spaces->underscore
++    return s.strip().lower().replace(" ", "_")
++
++def _parse_removal_text_to_set(text: str) -> set:
++    out = set()
++    if not text:
++        return out
++    # 改行 / カンマのどちらでも区切れるようにする
++    text = text.replace("\r", "\n")
++    for line in text.split("\n"):
++        if not line:
++            continue
++        if line.lstrip().startswith("#"):
++            continue
++        parts = [p for p in line.split(",")] if "," in line else [line]
++        for p in parts:
++            t = _normalize_tag(p)
++            if t:
++                out.add(t)
++    return out
++
++def _read_removal_text() -> str:
++    path = _removal_file_path()
++    if not os.path.exists(path):
++        return ""
++    try:
++        with io.open(path, "r", encoding="utf-8") as f:
++            return f.read()
++    except Exception:
++        return ""
++
++def _write_removal_text(content: str) -> None:
++    path = _removal_file_path()
++    tmp = path + ".tmp"
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    with io.open(tmp, "w", encoding="utf-8", newline="\n") as f:
++        f.write(content if content is not None else "")
++    os.replace(tmp, path)
++
++def _load_removal_set(force: bool = False) -> set:
++    """ファイル更新検知つきで除外セットを返す（生成時はこれを参照）。"""
++    path = _removal_file_path()
++    mtime = os.path.getmtime(path) if os.path.exists(path) else None
++    if not force and _REMOVAL_CACHE["mtime"] == mtime:
++        return _REMOVAL_CACHE["set"]
++    text = _read_removal_text()
++    s = _parse_removal_text_to_set(text)
++    _REMOVAL_CACHE["mtime"] = mtime
++    _REMOVAL_CACHE["set"] = s
++    return s
++
++def _apply_removal_filter(raw_tags: list) -> list:
++    """Gelbooruの生タグ列（lower/underscore想定）に除外集合を適用。"""
++    try:
++        removal = _load_removal_set(force=False)
++        if not removal:
++            return raw_tags
++        return [t for t in raw_tags if t and _normalize_tag(t) not in removal]
++    except Exception:
++        # どんなI/Oエラーでも生成を止めない
++        return raw_tags
++
++# ---------- UI glue for Removal List ----------
++def _ui_load_removal_text() -> str:
++    # 初期表示時（UI構築時）に読み込む
++    return _read_removal_text()
++
++def _ui_reload_removal_text():
++    # Reloadボタン：ファイル→テキストエリア
++    # ついでにキャッシュも更新
++    _load_removal_set(force=True)
++    return _read_removal_text()
++
++def _ui_save_removal_text(content: str):
++    # Saveボタン：テキストエリア→ファイル→キャッシュ更新→エコーバック
++    _write_removal_text(content or "")
++    _load_removal_set(force=True)
++    return content or ""

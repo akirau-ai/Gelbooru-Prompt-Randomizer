@@ -7,6 +7,20 @@ import gradio as gr
 from modules import scripts, shared, script_callbacks
 from scripts.Gel import Gelbooru
 
+import re
+import random
+
+def _expand_or_pattern_simple(s: str) -> str:
+    if not s:
+        return s
+    pattern = re.compile(r"\(([^()]+)\)")
+    def repl(match):
+        parts = match.group(1).split("|")
+        parts = [p.strip() for p in parts if p.strip()]
+        return random.choice(parts) if parts else ""
+    return pattern.sub(repl, s)
+
+
 # ==========================================================
 # Utility: async-safe runner
 # ==========================================================
@@ -117,6 +131,8 @@ def _ui_save_removal_text(content: str):
 # Core tag fetcher (shared between UI & auto mode)
 # ==========================================================
 async def get_random_tags(include, exclude):
+    include = _expand_or_pattern_simple(include)
+    exclude = _expand_or_pattern_simple(exclude)
     # 既存仕様：スペースはすべて削除、カンマ区切り
     include = include.replace(" ", "")
     exclude = exclude.replace(" ", "")
@@ -166,6 +182,9 @@ def _fetch_tags_sync(include_str, exclude_str):
     user_id = getattr(shared.opts, "gpr_user_id", None)
     if not api_key or not user_id:
         return None
+
+    include_str = _expand_or_pattern_simple(include_str)
+    exclude_str = _expand_or_pattern_simple(exclude_str)
 
     # 既存仕様：スペースはすべて削除、カンマ区切り
     include = include_str.replace(" ", "") if include_str else ""

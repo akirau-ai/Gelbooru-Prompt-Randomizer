@@ -49,8 +49,10 @@ def _run_async(coro):
 _REMOVAL_CACHE = {"mtime": None, "set": set()}
 
 def _removal_file_path() -> str:
-    base_dir = os.path.dirname(__file__)
-    return os.path.join(base_dir, "removal_tags.txt")
+    ext_root = os.path.dirname(__file__)
+    list_dir = os.path.join(ext_root, "list")
+    os.makedirs(list_dir, exist_ok=True)  # フォルダが無ければ作成
+    return os.path.join(list_dir, "removal_tags.txt")
 
 def _normalize_tag(s: str) -> str:
     return s.strip().lower().replace(" ", "_")
@@ -233,7 +235,7 @@ class GPRScript(scripts.Script):
                 # ----- Removal List (TXT-backed) -----
                 with gr.Group():
                     removal_textbox = gr.Textbox(
-                        label="Removal List (1 tag per line, lines starting with # are comments)",
+                        label="Removal List (comma-separated or newline-separated tags; lines starting with # are comments)",
                         value=_ui_load_removal_text(),
                         lines=3
                     )

@@ -51,9 +51,9 @@ def _run_async(coro):
 _REMOVAL_CACHE = {"mtime": None, "set": set()}
 
 def _removal_file_path() -> str:
-    ext_root = os.path.dirname(__file__)
+    ext_root = os.path.dirname(os.path.dirname(__file__))
     list_dir = os.path.join(ext_root, "list")
-    os.makedirs(list_dir, exist_ok=True)  # フォルダが無ければ作成
+    os.makedirs(list_dir, exist_ok=True)
     return os.path.join(list_dir, "removal_tags.txt")
 
 def _normalize_tag(s: str) -> str:

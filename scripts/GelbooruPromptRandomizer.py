@@ -4,11 +4,13 @@ import requests
 import os
 import io
 import gradio as gr
-from modules import scripts, shared, script_callbacks
-from scripts.Gel import Gelbooru
-
 import re
 import random
+
+from modules import scripts, shared, script_callbacks
+from scripts.Gel import Gelbooru
+from modules.processing import StableDiffusionProcessingImg2Img
+from PIL import Image
 
 def _expand_or_pattern_simple(s: str) -> str:
     if not s:
@@ -292,15 +294,100 @@ class GPRScript(scripts.Script):
         if not enable_auto:
             return
 
-        tags = _fetch_tags_sync(include_box, exclude_box)
-        if not tags:
+        try:
+            # 1回のリクエストでタグ＋画像URL＋Post情報取得
+            tags_str, image_url, post_info = _run_async(get_random_tags(include_box, exclude_box))
+        except Exception as e:
+            print("[GPR] get_random_tags failed:", e)
             return
 
-        tags_str = ", ".join(tags)
+        # エラーメッセージ系は無視
+        if not tags_str or "You need" in tags_str or "Couldn't find" in tags_str:
+            return
+
+        # ---- プロンプトにタグを追加 ----
         if getattr(p, "prompt", ""):
             p.prompt = f"{p.prompt}, {tags_str}"
         else:
             p.prompt = tags_str
+
+        # ----------------------------------------------------
+        # SDXL 推奨解像度への自動調整（縮小のみ・比率最適化）
+        # ----------------------------------------------------
+        def _find_best_sdxl_size(w, h):
+            presets = [
+                (1024, 1024),
+                (1152, 896), (1216, 832), (1344, 768),
+                (1536, 640), (1568, 672), (1728, 576),
+                (896, 1152), (832, 1216), (768, 1344),
+                (640, 1536), (576, 1728), (512, 2048),
+            ]
+
+            aspect = w / h
+            best = None
+            best_diff = 999.0
+
+            for pw, ph in presets:
+                # ソースより大きいサイズはスキップ（縮小のみ）
+                if pw > w or ph > h:
+                    continue
+
+                diff = abs(aspect - (pw / ph))
+                if diff < best_diff:
+                    best_diff = diff
+                    best = (pw, ph)
+
+            return best
+
+        # ---- img2img のときのみ画像を投入＆解像度最適化 ----
+        if isinstance(p, StableDiffusionProcessingImg2Img) and image_url:
+            try:
+                resp = requests.get(image_url, timeout=10)
+
+                # Pillow で実体読み込み（ここで壊れた画像だと例外）
+                img = Image.open(io.BytesIO(resp.content))
+                img.load()
+                img = img.convert("RGB")
+
+                # ソース画像の実サイズから、最適な SDXL 推奨解像度を決定
+                px = img.width * img.height
+                if px <= 1_100_000:  # 1.1M以下は拡大も縮小も禁止
+                    print(f"[GPR] Keep original size due to low pixel count: {img.width}x{img.height}")
+                    p.width, p.height = img.width, img.height
+                else:
+                    best = _find_best_sdxl_size(img.width, img.height)
+                    if best:
+                        p.width, p.height = best
+                        print(f"[GPR] Auto SDXL Resize → {p.width}x{p.height}")
+                    else:
+                        print(f"[GPR] No suitable SDXL preset for {img.width}x{img.height}, keep original")
+
+                p.init_images = [img]
+                print(f"[GPR] Init Image Loaded (source) = {img.width}x{img.height}")
+
+            except Exception as e:
+                print("[GPR] Invalid image. Skip init image:", e)
+                return  # ←ここが最重要
+
+        # Include Tags をメタデータに保存
+        try:
+            include_raw = include_box if include_box else ""
+            if include_raw:
+                if not hasattr(p, "extra_generation_params"):
+                    p.extra_generation_params = {}
+                p.extra_generation_params["GPR Include Tags"] = include_raw
+        except Exception as e:
+            print("[GPR] Failed to insert include tags metadata:", e)
+
+        # メタデータに投稿ページURLを保存
+        try:
+            if post_info:
+                post_url = str(post_info)
+                if not hasattr(p, "extra_generation_params"):
+                    p.extra_generation_params = {}
+                p.extra_generation_params["GPR Post URL"] = post_url
+        except Exception as e:
+            print("[GPR] Metadata insert failed:", e)
 
     # ======================================================
     # 設定UI（既存）

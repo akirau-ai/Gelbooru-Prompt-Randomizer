@@ -12,6 +12,9 @@ from scripts.Gel import Gelbooru
 from modules.processing import StableDiffusionProcessingImg2Img
 from PIL import Image
 
+used_post_ids = set()
+total_count = None
+
 def _expand_or_pattern_simple(s: str) -> str:
     if not s:
         return s
@@ -175,10 +178,29 @@ async def get_random_tags(include, exclude):
         except Exception:
             image_url = None  # 接続失敗も同様にスキップ
 
-    return ', '.join(tags), image_url, str(gel_post)
+    return ', '.join(tags), image_url, gel_post
 
+def register_used_post(post_info):
+    global used_post_ids, total_count
+    if not post_info:
+        return
 
+    pid = getattr(post_info, "id", None)
+    if pid:
+        pid = str(pid)
+        if pid in used_post_ids:
+            print(f"[GPR] Duplicate detected: {pid} (skip)")
+        used_post_ids.add(pid)
 
+    # 総数取得
+    tc = getattr(post_info, "total_count", None)
+    if tc:
+        total_count = int(tc)
+
+def is_all_used():
+    if total_count is None:
+        return False
+    return len(used_post_ids) >= total_count
 
 def _fetch_tags_sync(include_str, exclude_str):
     """Used in before_process (sync wrapper)."""
@@ -310,6 +332,20 @@ class GPRScript(scripts.Script):
             p.prompt = f"{p.prompt}, {tags_str}"
         else:
             p.prompt = tags_str
+
+        # ---- Duplicate record ----
+        try:
+            register_used_post(post_info)
+        except Exception as e:
+            print("[GPR] register_used_post failed:", e)
+
+        # ---- Auto stop when exhausted ----
+        if is_all_used():
+            try:
+                p.batch_count = 1
+                print(f"[GPR] All {total_count} posts used. Auto stop next cycle.")
+            except:
+                pass
 
         # ----------------------------------------------------
         # SDXL 推奨解像度への自動調整（縮小のみ・比率最適化）

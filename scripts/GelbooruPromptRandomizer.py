@@ -411,7 +411,7 @@ class GPRScript(scripts.Script):
             if include_raw:
                 if not hasattr(p, "extra_generation_params"):
                     p.extra_generation_params = {}
-                p.extra_generation_params["GPR Include Tags"] = include_raw
+                p.extra_generation_params["GPR Include Tags"] = include_raw.replace('"', '')
         except Exception as e:
             print("[GPR] Failed to insert include tags metadata:", e)
 
@@ -421,7 +421,7 @@ class GPRScript(scripts.Script):
                 post_url = str(post_info)
                 if not hasattr(p, "extra_generation_params"):
                     p.extra_generation_params = {}
-                p.extra_generation_params["GPR Post URL"] = post_url
+                p.extra_generation_params["GPR Post URL"] = post_url.replace('"', '')
         except Exception as e:
             print("[GPR] Metadata insert failed:", e)
 

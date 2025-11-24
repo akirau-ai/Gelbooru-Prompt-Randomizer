@@ -131,7 +131,7 @@ class Gelbooru:
             GelbooruImage or None: Returns None if no posts are found with the specified tags.
         """
         endpoint = self._endpoint('post')
-        endpoint.args['limit'] = 1
+        endpoint.args['limit'] = 1000
 
         # Apply basic tag formatting
         tags = self._format_tags(tags, exclude_tags)
@@ -217,20 +217,30 @@ class Gelbooru:
         return endpoint
 
     def _format_tags(self, tags: list, exclude_tags: list):
-        """
-        Apply basic tag formatting
-        Args:
-            tags (list of str): A list of tags to search for
-            exclude_tags (list of str): A list of tags to EXCLUDE from search results
-        Returns:
-            list of str
-        """
-        # Apply basic tag formatting
         tags = [tag.strip().lower().replace(' ', '_') for tag in tags] if tags else []
-        exclude_tags = ['-' + tag.strip().lstrip('-').lower().replace(' ', '_') for tag in
-                        exclude_tags] if exclude_tags else []
+        exclude_tags = ['-' + tag.strip().lstrip('-').lower().replace(' ', '_')
+                        for tag in exclude_tags] if exclude_tags else []
+
+        # ============================================================
+        # Randomizer Optional Tag Filters
+        # コメントアウト／追加／削除だけで反映されます
+        # 例: "pool:123" "rating:safe" "status:active" など
+        # ============================================================
+        OPTIONAL_TAG_FILTERS = [
+            #"score:>=10",  # 任意の品質閾値
+            #"fav:1",       # 最低お気に入り数
+            # "pool:123",   # 例: プール限定
+            # "rating:safe",# 例: セーフ限定
+        ]
+    
+        # 追加適用（重複防止）
+        for opt in OPTIONAL_TAG_FILTERS:
+            opt_l = opt.lower()
+            if opt_l not in tags:
+                tags.append(opt_l)
 
         return tags + exclude_tags
+
 
     async def _request(self, url: str) -> bytes:
         async with aiohttp.ClientSession(loop=self._loop) as session:

@@ -215,6 +215,9 @@ class GPRScript(scripts.Script):
         self.exclude_box = None
         self._last_include = ""
         self._last_exclude = ""
+        self._cached_tags_str = ""
+        self._cached_image_url = ""
+        self._cached_post_info = None
 
     def title(self):
         return "Gelbooru Prompt Randomizer"
@@ -299,12 +302,25 @@ class GPRScript(scripts.Script):
         cur_exc = exclude_box or ""
         if cur_inc != self._last_include or cur_exc != self._last_exclude:
             used_post_ids.clear()
+            self._cached_tags_str = ""
+            self._cached_image_url = ""
+            self._cached_post_info = None
             print("[GPR] Tag conditions changed → used list cleared")
         self._last_include = cur_inc
         self._last_exclude = cur_exc
 
         try:
-            tags_str, image_url, post_info = _fetch_tags_sync(include_box, exclude_box)
+            # === 必ず1回だけfetch ===
+            if not self._cached_post_info:
+                tags_str, image_url, post_info = _fetch_tags_sync(include_box, exclude_box)
+                self._cached_tags_str = tags_str
+                self._cached_image_url = image_url
+                self._cached_post_info = post_info
+            else:
+                tags_str = self._cached_tags_str
+                image_url = self._cached_image_url
+                post_info = self._cached_post_info
+
         except Exception as e:
             print("[GPR] before_process failed (fetch_tags):", e)
             return
@@ -317,7 +333,6 @@ class GPRScript(scripts.Script):
             except:
                 pass
             return
-
 
         # ---- プロンプトにタグを追加 ----      
         rm = self.removal_textbox.value
@@ -332,6 +347,12 @@ class GPRScript(scripts.Script):
             register_used_post(post_info)
         except Exception as e:
             print("[GPR] register_used_post failed:", e)
+        
+        # ---- cache clear ----
+        self._cached_tags_str = ""
+        self._cached_image_url = ""
+        self._cached_post_info = None
+        print("[GPR] Fetch cache cleared (force next fetch)")
 
         # ---- Auto stop when exhausted ----
         if is_all_used():
@@ -391,9 +412,51 @@ class GPRScript(scripts.Script):
                 p.init_images = [img]
                 print(f"[GPR] Init Image Loaded (source) = {img.width}x{img.height}")
 
-            except Exception as e:
-                print("[GPR] Invalid image. Skip init image:", e)
-                return  # ←ここが最重要
+                # ---------------------------------------------
+                # 検証用：実際に参照したソース画像を保存（POST ID名）
+                # ---------------------------------------------
+                try:
+                    import re
+                    # POST ID 抽出
+                    pid_match = re.search(r'id=(\d+)', str(post_info))
+                    if pid_match:
+                        pid = pid_match.group(1)
+        
+                        # 保存先ディレクトリ
+                        import os
+                        ext_root = os.path.dirname(os.path.dirname(__file__))
+                        src_dir = os.path.join(ext_root, "source_images")
+                        os.makedirs(src_dir, exist_ok=True)
+        
+                        # JPEG形式で保存
+                        save_path = os.path.join(src_dir, f"{pid}.jpg")
+                        img.save(save_path, format="JPEG")
+                        print(f"[GPR] Source image saved → {save_path}")
+                    else:
+                        print("[GPR] No post ID found → source image not saved")
+                except Exception as e:
+                    print("[GPR] Failed to save source image:", e)
+                # ---------------------------------------------
+                # 検証用：実際に参照したソース画像を保存　ここまで
+                # ---------------------------------------------
+
+            except Exception as e:  
+                print("[GPR] Invalid image. Trying next candidate:", e)
+
+                # === NG画像も使用済みとして登録 ===
+                try:
+                    pid_match = re.search(r'id=(\d+)', str(post_info))
+                    if pid_match:
+                        used_post_ids.add(pid_match.group(1))
+                except:
+                    pass
+
+                # === 次サイクルで必ず新しい候補を取得させる ===
+                self._cached_post_info = None
+                self._cached_image_url = ""
+                self._cached_tags_str = ""
+
+                return  # ←今回はこの生成をスキップ。次ループで再取得
 
         # Include Tags をメタデータに保存
         try:
@@ -410,7 +473,7 @@ class GPRScript(scripts.Script):
             if post_info:
 
                 # --- POST ページ URL（引用符除去） ---
-                post_url = str(post_info).replace('"', '')
+                post_url = str(self._cached_post_info).replace('"', '')
 
                 if not hasattr(p, "extra_generation_params"):
                     p.extra_generation_params = {}
@@ -418,7 +481,7 @@ class GPRScript(scripts.Script):
                 p.extra_generation_params["GPR Post URL"] = post_url
 
                 # --- 画像取得用 file_url の併記（引用符除去） ---
-                img_url = (image_url or "").replace('"', '')
+                img_url = (self._cached_image_url or "").replace('"', '')
                 p.extra_generation_params["GPR Image URL"] = img_url
     
         except Exception as e:

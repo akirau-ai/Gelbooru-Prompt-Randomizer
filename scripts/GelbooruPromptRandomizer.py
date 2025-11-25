@@ -17,14 +17,13 @@ total_count = None
 
 def _expand_or_pattern_simple(s: str) -> str:
     if not s:
-        return s
-    pattern = re.compile(r"\(([^()]+)\)")
+        return s    
+    pattern = re.compile(r"\{([^{}]*\|[^{}]*)\}")
     def repl(match):
         parts = match.group(1).split("|")
         parts = [p.strip() for p in parts if p.strip()]
         return random.choice(parts) if parts else ""
     return pattern.sub(repl, s)
-
 
 # ==========================================================
 # Utility: async-safe runner
@@ -108,15 +107,9 @@ def _load_removal_set(force: bool = False) -> set:
     _REMOVAL_CACHE["set"] = s
     return s
 
-def _apply_removal_filter(raw_tags: list) -> list:
-    """
-    Gelbooruの生タグ列（lower/underscore想定）に除外集合を適用。
-    失敗しても生成は止めない。
-    """
-    try:
-        removal = _load_removal_set(force=False)
-        if not removal:
-            return raw_tags
+def _apply_removal_filter(raw_tags: list, removal_text: str = "") -> list:
+    try:  
+        removal = _parse_removal_text_to_set(removal_text)
         return [t for t in raw_tags if t and _normalize_tag(t) not in removal]
     except Exception:
         return raw_tags
@@ -133,52 +126,6 @@ def _ui_save_removal_text(content: str):
     _write_removal_text(content or "")
     _load_removal_set(force=True)
     return content or ""
-
-# ==========================================================
-# Core tag fetcher (shared between UI & auto mode)
-# ==========================================================
-async def get_random_tags(include, exclude):
-    include = _expand_or_pattern_simple(include)
-    exclude = _expand_or_pattern_simple(exclude)
-    # 既存仕様：スペースはすべて削除、カンマ区切り
-    include = include.replace(" ", "")
-    exclude = exclude.replace(" ", "")
-    api_key = getattr(shared.opts, "gpr_api_key", None)
-    user_id = getattr(shared.opts, "gpr_user_id", None)
-
-    if(api_key == "" or user_id == ""):
-        return "You need to log in to your gelbooru account", None, "You need to log in to your gelbooru account"
-
-    include = include.split(',') if include else None
-    exclude = exclude.split(',') if exclude else None
-
-    gel_post = await Gelbooru(api_key=api_key, user_id=user_id).random_post(tags=include, exclude_tags=exclude)
-    if(gel_post == None or gel_post == []):
-        return "Couldn't find a post with the specified tags", None, "Couldn't find a post with the specified tags"
-    
-    tags = gel_post.get_tags()
-    # ★ 追加：出力時の除外フィルタ（TXT）
-    tags = _apply_removal_filter(tags)
-
-    # 既存仕様：除外リストに無いものだけ "_"→" " の可読化
-    excl = getattr(shared.opts, "gpr_undersocreReplacementExclusionList").split(',')
-    for i in range(len(tags)):
-        if(tags[i] not in excl):
-            tags[i] = tags[i].replace("_", " ")
-
-    # --- 安全化: 画像URLの存在確認 ---
-    image_url = getattr(gel_post, "file_url", None)
-    if not image_url or not isinstance(image_url, str) or not image_url.strip():
-        image_url = None
-    else:
-        try:
-            resp = requests.head(image_url, timeout=5)
-            if resp.status_code != 200:
-                image_url = None  # 死んだURLはスキップ
-        except Exception:
-            image_url = None  # 接続失敗も同様にスキップ
-
-    return ', '.join(tags), image_url, gel_post
 
 def register_used_post(post_info):
     global used_post_ids, total_count
@@ -202,35 +149,59 @@ def is_all_used():
         return False
     return len(used_post_ids) >= total_count
 
-def _fetch_tags_sync(include_str, exclude_str):
-    """Used in before_process (sync wrapper)."""
-    api_key = getattr(shared.opts, "gpr_api_key", None)
-    user_id = getattr(shared.opts, "gpr_user_id", None)
-    if not api_key or not user_id:
-        return None
+def _fetch_tags_sync(include_str, exclude_str, removal_text=""):
+    include_raw = _expand_or_pattern_simple(include_str or "")
+    exclude_raw = _expand_or_pattern_simple(exclude_str or "")
+    include_raw = include_raw.replace(" ", "")
+    exclude_raw = exclude_raw.replace(" ", "")
+    include = include_raw.split(",") if include_raw else []
+    exclude = exclude_raw.split(",") if exclude_raw else []
 
-    include_str = _expand_or_pattern_simple(include_str)
-    exclude_str = _expand_or_pattern_simple(exclude_str)
+    try:
+        gel = Gelbooru(shared.opts.gpr_api_key, shared.opts.gpr_user_id)
+        results = _run_async(gel.search_posts(tags=include, exclude_tags=exclude, limit=1000))
 
-    # 既存仕様：スペースはすべて削除、カンマ区切り
-    include = include_str.replace(" ", "") if include_str else ""
-    exclude = exclude_str.replace(" ", "") if exclude_str else ""
-    include_list = include.split(',') if include else None
-    exclude_list = exclude.split(',') if exclude else None
+        if not results:
+            print("[GPR] No results from API")
+            return "", None, None
 
-    gel = Gelbooru(api_key=api_key, user_id=user_id)
-    post = _run_async(gel.random_post(tags=include_list, exclude_tags=exclude_list))
-    if not post:
-        return None
+        # 使用済み・DL失敗・NGタグを除外しながら次候補探索
+        for gel_post in results:
+            post_url = str(gel_post)
+            pid_match = re.search(r'id=(\d+)', post_url)
+            if not pid_match:
+                continue
+            pid = pid_match.group(1)
 
-    tags = post.get_tags()
-    # ★ 追加：出力時の除外フィルタ（TXT）
-    tags = _apply_removal_filter(tags)
+            # 既に使用済みならスキップ
+            if pid in used_post_ids:
+                continue
 
-    # 既存仕様：除外リストに無いものだけ "_"→" " の可読化
-    excl = getattr(shared.opts, "gpr_undersocreReplacementExclusionList").split(',')
-    processed = [t.replace("_", " ") if t not in excl else t for t in tags]
-    return processed
+            image_url = getattr(gel_post, "file_url", None)
+            if not image_url:
+                continue
+
+            # DLテスト
+            try:
+                resp = requests.get(image_url, timeout=10)
+                resp.raise_for_status()
+            except Exception:
+                print(f"[GPR] Skip invalid image: {image_url}")
+                continue
+
+            # NGタグ除外
+            tags_list = getattr(gel_post, "tags", [])
+            tags_str = ", ".join(tags_list)
+
+            used_post_ids.add(pid)  # 使用済み管理（セッションのみ）
+            return tags_str, image_url, post_url
+
+        print("[GPR] No unused valid images left")
+        return "", None, None
+
+    except Exception as e:
+        print("[GPR] _fetch_tags_sync failed:", e)
+        return "", None, None
 
 
 # ==========================================================
@@ -242,6 +213,8 @@ class GPRScript(scripts.Script):
         self.enable_auto = None
         self.include_box = None
         self.exclude_box = None
+        self._last_include = ""
+        self._last_exclude = ""
 
     def title(self):
         return "Gelbooru Prompt Randomizer"
@@ -258,7 +231,7 @@ class GPRScript(scripts.Script):
 
                 # ----- Removal List (TXT-backed) -----
                 with gr.Group():
-                    removal_textbox = gr.Textbox(
+                    self.removal_textbox = gr.Textbox(
                         label="Removal List (comma-separated or newline-separated tags; lines starting with # are comments)",
                         value=_ui_load_removal_text(),
                         lines=3
@@ -281,25 +254,30 @@ class GPRScript(scripts.Script):
             # Removal Save/Reload
             removal_save_btn.click(
                 fn=_ui_save_removal_text,
-                inputs=[removal_textbox],
-                outputs=[removal_textbox],
+                inputs=[self.removal_textbox],
+                outputs=[self.removal_textbox],
             )
             removal_reload_btn.click(
                 fn=_ui_reload_removal_text,
                 inputs=None,
-                outputs=[removal_textbox],
+                outputs=[self.removal_textbox],
             )
 
             append_tags_button.click(
-                fn=lambda result_tags, tags: (f"{tags}, {result_tags}"),
-                inputs=[result_tags_textbox, self.text2img if not is_img2img else self.img2img],
+                    fn=lambda result_tags, tags, rm: (
+                    ", ".join(_apply_removal_filter(result_tags.split(", "), rm))
+                    if result_tags else ""
+                ),
+                inputs=[result_tags_textbox, self.text2img if not is_img2img else self.img2img, self.removal_textbox],
                 outputs=self.text2img if not is_img2img else self.img2img,
             )
+
             send_text_button.click(
-                fn=get_random_tags,
-                inputs=[self.include_box, self.exclude_box],
+                fn=lambda inc, exc, rm: _fetch_tags_sync(inc, exc, rm),
+                inputs=[self.include_box, self.exclude_box, self.removal_textbox],
                 outputs=[result_tags_textbox, preview_image, url_textbox],
             )
+
             clear_button.click(
                 fn=lambda: (None, None, None),
                 inputs=None,
@@ -316,22 +294,38 @@ class GPRScript(scripts.Script):
         if not enable_auto:
             return
 
+        # ==== タグ条件変更検知して使用済みリセット ====
+        cur_inc = include_box or ""
+        cur_exc = exclude_box or ""
+        if cur_inc != self._last_include or cur_exc != self._last_exclude:
+            used_post_ids.clear()
+            print("[GPR] Tag conditions changed → used list cleared")
+        self._last_include = cur_inc
+        self._last_exclude = cur_exc
+
         try:
-            # 1回のリクエストでタグ＋画像URL＋Post情報取得
-            tags_str, image_url, post_info = _run_async(get_random_tags(include_box, exclude_box))
+            tags_str, image_url, post_info = _fetch_tags_sync(include_box, exclude_box)
         except Exception as e:
-            print("[GPR] get_random_tags failed:", e)
+            print("[GPR] before_process failed (fetch_tags):", e)
             return
 
-        # エラーメッセージ系は無視
-        if not tags_str or "You need" in tags_str or "Couldn't find" in tags_str:
+        if not tags_str or not image_url:
+            print("[GPR] before_process: no valid tags/image → Auto stop")
+            print(f"[GPR] Used: {len(used_post_ids)} / Cycle max 100")
+            try:
+                p.batch_count = 1
+            except:
+                pass
             return
 
-        # ---- プロンプトにタグを追加 ----
+
+        # ---- プロンプトにタグを追加 ----      
+        rm = self.removal_textbox.value
+        filtered = ", ".join(_apply_removal_filter(tags_str.split(", "), rm))
         if getattr(p, "prompt", ""):
-            p.prompt = f"{p.prompt}, {tags_str}"
+            p.prompt = f"{p.prompt}, {filtered}"
         else:
-            p.prompt = tags_str
+            p.prompt = filtered
 
         # ---- Duplicate record ----
         try:
@@ -364,10 +358,6 @@ class GPRScript(scripts.Script):
             best_diff = 999.0
 
             for pw, ph in presets:
-                # ソースより大きいサイズはスキップ（縮小のみ）
-                if pw > w or ph > h:
-                    continue
-
                 diff = abs(aspect - (pw / ph))
                 if diff < best_diff:
                     best_diff = diff
@@ -387,7 +377,7 @@ class GPRScript(scripts.Script):
 
                 # ソース画像の実サイズから、最適な SDXL 推奨解像度を決定
                 px = img.width * img.height
-                if px <= 1_100_000:  # 1.1M以下は拡大も縮小も禁止
+                if px <= 300_000:  # 指定値以下は拡大も縮小も禁止。推薦値は1_100_000（=1.1M）
                     print(f"[GPR] Keep original size due to low pixel count: {img.width}x{img.height}")
                     p.width, p.height = img.width, img.height
                 else:
@@ -418,10 +408,19 @@ class GPRScript(scripts.Script):
         # メタデータに投稿ページURLを保存
         try:
             if post_info:
-                post_url = str(post_info)
+
+                # --- POST ページ URL（引用符除去） ---
+                post_url = str(post_info).replace('"', '')
+
                 if not hasattr(p, "extra_generation_params"):
                     p.extra_generation_params = {}
-                p.extra_generation_params["GPR Post URL"] = post_url.replace('"', '')
+
+                p.extra_generation_params["GPR Post URL"] = post_url
+
+                # --- 画像取得用 file_url の併記（引用符除去） ---
+                img_url = (image_url or "").replace('"', '')
+                p.extra_generation_params["GPR Image URL"] = img_url
+    
         except Exception as e:
             print("[GPR] Metadata insert failed:", e)
 

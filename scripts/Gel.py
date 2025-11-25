@@ -120,64 +120,23 @@ class Gelbooru:
 
         return GelbooruImage(payload['posts']['post'], self)
 
-    async def random_post(self, *, tags: Optional[List[str]] = None,
-                          exclude_tags: Optional[List[str]] = None) -> Optional[List[GelbooruImage]]:
-        """
-        Search for and return a single random image with the specified tags.
-        Args:
-            tags (list of str): A list of tags to search for
-            exclude_tags (list of str): A list of tags to EXCLUDE from search results
-        Returns:
-            GelbooruImage or None: Returns None if no posts are found with the specified tags.
-        """
-        endpoint = self._endpoint('post')
-        endpoint.args['limit'] = 1000
-
-        # Apply basic tag formatting
-        tags = self._format_tags(tags, exclude_tags)
-        if tags:
-            endpoint.args['tags'] = ' '.join(tags)
-
-        # Run the initial query to get the number of posts available
-        payload = await self._request(str(endpoint))
-        try:
-            payload = xmltodict.parse(payload)
-
-            # Cross compatability with older Booru API's
-            payload = {k.strip('@'): v for k, v in payload.items()}
-        except xml.parsers.expat.ExpatError:
-            raise GelbooruException("Gelbooru returned a malformed response")
-
-        # Count is 0? We have no results to fetch then
-        count = int(payload['posts']['@count'])
-        if not count:
-            return None
-
-        # Otherwise, let's pull a random ID from the number of posts
-        offset = randint(0, min(count, 20000))
-
-        return await self.search_posts(tags=tags, exclude_tags=exclude_tags, limit=1, page=offset)
-
     async def search_posts(self, *, tags: Optional[List[str]] = None,
                            exclude_tags: Optional[List[str]] = None,
-                           limit: int = 100,
-                           page: int = 0) -> Union[List[GelbooruImage], GelbooruImage]:
-        """
-        Search for images with the optionally specified tag(s)
-        Args:
-            tags (list of str): A list of tags to search for
-            exclude_tags (list of str): A list of tags to EXCLUDE from search results
-            limit (int): Limit the number of results returned. Defaults to 100
-            page (int): The page number
-        Returns:
-            list of GelbooruImage or GelbooruImage: Returns a single GelbooruImage of a limit of 1 is supplied
-        """
+                           limit: int = 1000) -> List[GelbooruImage]:
+    
         endpoint = self._endpoint('post')
-        endpoint.args['limit'] = limit
-        endpoint.args['pid'] = page
 
         # Apply basic tag formatting
         tags = self._format_tags(tags, exclude_tags)
+        # --- gel-api.py と同じ方式：sort:random を tags に追加 ---
+        if tags is None:
+            tags = []
+        else:
+            tags = [t for t in tags if t]  # 空除去
+
+        if "sort:random" not in tags:
+            tags.append("sort:random")
+
         if tags:
             endpoint.args['tags'] = ' '.join(tags)
 
@@ -189,17 +148,13 @@ class Gelbooru:
             raise GelbooruException("Gelbooru returned a malformed response")
         if 'posts' not in payload or 'post' not in payload["posts"]:
             return []
+    
+        posts = payload['posts']['post']
+        result = [GelbooruImage(p, self) for p in posts] \
+            if isinstance(posts, list) \
+            else [GelbooruImage(posts, self)]
 
-        # Single results are not returned as arrays/lists and need to be processed directly instead of iterated
-        result = [GelbooruImage(p, self) for p in payload['posts']['post']] \
-            if isinstance(payload['posts']['post'], list) \
-            else [GelbooruImage(payload['posts']['post'], self)]
-
-        # Return the first result if we have a limit of 1 explicitly set
-        if limit == 1:
-            return result[0]
-        else:
-            return result
+        return result
 
     def _endpoint(self, s: str) -> furl:
         endpoint = furl(self._base_url)

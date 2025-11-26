@@ -342,26 +342,6 @@ class GPRScript(scripts.Script):
         else:
             p.prompt = filtered
 
-        # ---- Duplicate record ----
-        try:
-            register_used_post(post_info)
-        except Exception as e:
-            print("[GPR] register_used_post failed:", e)
-        
-        # ---- cache clear ----
-        self._cached_tags_str = ""
-        self._cached_image_url = ""
-        self._cached_post_info = None
-        print("[GPR] Fetch cache cleared (force next fetch)")
-
-        # ---- Auto stop when exhausted ----
-        if is_all_used():
-            try:
-                p.batch_count = 1
-                print(f"[GPR] All {total_count} posts used. Auto stop next cycle.")
-            except:
-                pass
-
         # ----------------------------------------------------
         # SDXL 推奨解像度への自動調整（縮小のみ・比率最適化）
         # ----------------------------------------------------
@@ -483,6 +463,43 @@ class GPRScript(scripts.Script):
                 # --- 画像取得用 file_url の併記（引用符除去） ---
                 img_url = (self._cached_image_url or "").replace('"', '')
                 p.extra_generation_params["GPR Image URL"] = img_url
+        
+                # -----------------------------------------
+                # 末尾：使用済みURL登録（前方から移動）
+                # -----------------------------------------
+                try:
+                    register_used_post(post_info)
+                except Exception as e:
+                    print("[GPR] register_used_post failed:", e)
+
+                # -----------------------------------------
+                # Auto stop （前方から移動）
+                # -----------------------------------------
+                if is_all_used():
+                    try:
+                        p.batch_count = 1
+                        print(f"[GPR] All {total_count} posts used. Auto stop next cycle.")
+                    except:
+                        pass
+
+                # -----------------------------------------
+                # 条件付きキャッシュクリア
+                # 「使用済み登録されなかったURLのみ保持」
+                #   → register_used_post が成功していれば削除する
+                # -----------------------------------------
+                if self._cached_image_url:
+                    pid_match = re.search(r'id=(\d+)', str(post_info))
+                    pid = pid_match.group(1) if pid_match else None
+                    if pid and pid in used_post_ids:
+                        # normally clear
+                        self._cached_tags_str = ""
+                        self._cached_image_url = ""
+                        self._cached_post_info = None
+                        print("[GPR] Cache cleared (registered)")
+                    else:
+                        # keep cache because URL not registered
+                        print("[GPR] Cache kept (unregistered)")
+
     
         except Exception as e:
             print("[GPR] Metadata insert failed:", e)

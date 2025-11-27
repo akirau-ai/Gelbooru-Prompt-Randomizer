@@ -13,7 +13,6 @@ from modules.processing import StableDiffusionProcessingImg2Img
 from PIL import Image
 
 used_post_ids = set()
-total_count = None
 
 def _expand_or_pattern_simple(s: str) -> str:
     if not s:
@@ -127,28 +126,6 @@ def _ui_save_removal_text(content: str):
     _load_removal_set(force=True)
     return content or ""
 
-def register_used_post(post_info):
-    global used_post_ids, total_count
-    if not post_info:
-        return
-
-    pid = getattr(post_info, "id", None)
-    if pid:
-        pid = str(pid)
-        if pid in used_post_ids:
-            print(f"[GPR] Duplicate detected: {pid} (skip)")
-        used_post_ids.add(pid)
-
-    # 総数取得
-    tc = getattr(post_info, "total_count", None)
-    if tc:
-        total_count = int(tc)
-
-def is_all_used():
-    if total_count is None:
-        return False
-    return len(used_post_ids) >= total_count
-
 def _fetch_tags_sync(include_str, exclude_str, removal_text=""):
     include_raw = _expand_or_pattern_simple(include_str or "")
     exclude_raw = _expand_or_pattern_simple(exclude_str or "")
@@ -164,14 +141,15 @@ def _fetch_tags_sync(include_str, exclude_str, removal_text=""):
         if not results:
             print("[GPR] No results from API")
             return "", None, None
-
+      
         # 使用済み・DL失敗・NGタグを除外しながら次候補探索
         for gel_post in results:
-            post_url = str(gel_post)
-            pid_match = re.search(r'id=(\d+)', post_url)
-            if not pid_match:
+            # API取得時にPOSTページURLを確定させる
+            raw_id = getattr(gel_post, "id", None)
+            if raw_id is None:
                 continue
-            pid = pid_match.group(1)
+            pid = str(raw_id)
+            post_url = f"https://gelbooru.com/index.php?page=post&s=view&id={pid}"
 
             # 既に使用済みならスキップ
             if pid in used_post_ids:
@@ -219,6 +197,8 @@ class GPRScript(scripts.Script):
         self._cached_image_url = ""
         self._cached_post_info = None
 
+        self._fatal_api_error = False
+
     def title(self):
         return "Gelbooru Prompt Randomizer"
 
@@ -228,9 +208,32 @@ class GPRScript(scripts.Script):
     def ui(self, is_img2img):
         with gr.Accordion('Gelbooru Prompt Randomizer', open=False):
             with gr.Column():
-                self.include_box = gr.Textbox(label='Include Tags', placeholder="e.g. 1girl, blue_hair, solo")
-                self.exclude_box = gr.Textbox(label='Exclude Tags', placeholder="e.g. nsfw, text, watermark")
-                self.enable_auto = gr.Checkbox(label="Enable Auto Mode (fetch before generation)", value=False)
+
+                # ---- 1段目：Include (単独) ----
+                self.include_box = gr.Textbox(
+                    label='Include Tags',
+                    placeholder="e.g. 1girl, blue_hair, solo",
+                )
+
+                # ---- 2段目：Exclude + Scale（横並び）----
+                with gr.Row():
+                    self.exclude_box = gr.Textbox(
+                        label='Exclude Tags',
+                        placeholder='e.g. nsfw, text, watermark',
+                        scale=3
+                    )
+
+                    self.scale_box = gr.Textbox(
+                        label='SDXL Resize Scale',
+                        value="1.0",
+                        placeholder="1.0 / 1.2 / 1.5",
+                        scale=1
+                    )
+                # ---- Enable Auto Mode ----
+                self.enable_auto = gr.Checkbox(
+                    label="Enable Auto Mode (fetch before generation)",
+                    value=False
+                )
 
                 # ----- Removal List (TXT-backed) -----
                 with gr.Group():
@@ -254,7 +257,6 @@ class GPRScript(scripts.Script):
 
         # === Button bindings ===
         with contextlib.suppress(AttributeError):
-            # Removal Save/Reload
             removal_save_btn.click(
                 fn=_ui_save_removal_text,
                 inputs=[self.removal_textbox],
@@ -267,7 +269,7 @@ class GPRScript(scripts.Script):
             )
 
             append_tags_button.click(
-                    fn=lambda result_tags, tags, rm: (
+                fn=lambda result_tags, tags, rm: (
                     ", ".join(_apply_removal_filter(result_tags.split(", "), rm))
                     if result_tags else ""
                 ),
@@ -286,55 +288,86 @@ class GPRScript(scripts.Script):
                 inputs=None,
                 outputs=[preview_image, url_textbox, result_tags_textbox],
             )
-
-        # Return order: must match before_process args
-        return [self.enable_auto, self.include_box, self.exclude_box]
+        return [self.enable_auto, self.include_box, self.exclude_box, self.scale_box]
 
     # ======================================================
     # 自動実行フック：EnableがONのときだけ実行
     # ======================================================
-    def before_process(self, p, enable_auto, include_box, exclude_box):
+    def before_process(self, p, enable_auto, include_box, exclude_box, scale_box):
         if not enable_auto:
             return
 
-        # ==== タグ条件変更検知して使用済みリセット ====
+        # ==== タグ条件変更検知（このpに紐づくキャッシュだけ無効化）====
         cur_inc = include_box or ""
         cur_exc = exclude_box or ""
         if cur_inc != self._last_include or cur_exc != self._last_exclude:
-            used_post_ids.clear()
-            self._cached_tags_str = ""
-            self._cached_image_url = ""
-            self._cached_post_info = None
-            print("[GPR] Tag conditions changed → used list cleared")
+            print("[GPR] Tag conditions changed → cache cleared for this cycle")
+            if hasattr(p, "_gpr_cached_post_info"):
+                p._gpr_cached_post_info = None
+                p._gpr_cached_image_url = None
+                p._gpr_cached_tags_str = ""
+
         self._last_include = cur_inc
         self._last_exclude = cur_exc
 
+        if self._fatal_api_error:
+            print("[GPR] Fatal API error → skip before_process")
+            return
+
         try:
-            # === 必ず1回だけfetch ===
-            if not self._cached_post_info:
+            # === 必ず1サイクルにつき1回だけfetch（p単位のキャッシュ） ===
+            if not hasattr(p, "_gpr_cached_post_info") or not p._gpr_cached_post_info:
                 tags_str, image_url, post_info = _fetch_tags_sync(include_box, exclude_box)
-                self._cached_tags_str = tags_str
-                self._cached_image_url = image_url
-                self._cached_post_info = post_info
+                p._gpr_cached_tags_str = tags_str
+                p._gpr_cached_image_url = image_url
+                p._gpr_cached_post_info = post_info
             else:
-                tags_str = self._cached_tags_str
-                image_url = self._cached_image_url
-                post_info = self._cached_post_info
+                tags_str = p._gpr_cached_tags_str
+                image_url = p._gpr_cached_image_url
+                post_info = p._gpr_cached_post_info
 
         except Exception as e:
             print("[GPR] before_process failed (fetch_tags):", e)
             return
 
+        # --- API失敗時の再取得ループ（最大5回・2秒間隔） ---
+        retry_count = 0
+        while (not tags_str or not image_url) and retry_count < 5:
+            retry_count += 1
+            print(f"[GPR] API retry {retry_count}/5 (waiting 2s)")
+            import time
+            time.sleep(2)
+
+            try:
+                tags_str, image_url, post_info = _fetch_tags_sync(include_box, exclude_box)
+                # リトライ成功時も p 側キャッシュを更新
+                p._gpr_cached_tags_str = tags_str
+                p._gpr_cached_image_url = image_url
+                p._gpr_cached_post_info = post_info
+            except Exception as e:
+                print(f"[GPR] retry fetch failed: {e}")
+                tags_str, image_url, post_info = "", None, None
+
+        # --- 最終判定（10回失敗） ---
         if not tags_str or not image_url:
-            print("[GPR] before_process: no valid tags/image → Auto stop")
+            print("[GPR] API failed after 5 retries → Auto stop.")
             print(f"[GPR] Used: {len(used_post_ids)} / Cycle max 100")
+
+            # ★ 次サイクルの before_process を完全停止するフラグ
+            self._fatal_api_error = True
+
             try:
                 p.batch_count = 1
             except:
                 pass
             return
 
-        # ---- プロンプトにタグを追加 ----      
+        # --- リトライ成功時は p 側キャッシュ更新 ---
+        p._gpr_cached_tags_str = tags_str
+        p._gpr_cached_image_url = image_url
+        p._gpr_cached_post_info = post_info
+
+        # ---- プロンプトにタグを追加（filtered） ----
         rm = self.removal_textbox.value
         filtered = ", ".join(_apply_removal_filter(tags_str.split(", "), rm))
         if getattr(p, "prompt", ""):
@@ -369,6 +402,15 @@ class GPRScript(scripts.Script):
         # ---- img2img のときのみ画像を投入＆解像度最適化 ----
         if isinstance(p, StableDiffusionProcessingImg2Img) and image_url:
             try:
+                # ---- SDXL Resize Scale ----
+                try:
+                    scale = float(scale_box)
+                except:
+                    scale = 1.0
+
+                def _round64(x):
+                    return max(64, int(round(x / 64)) * 64)
+
                 resp = requests.get(image_url, timeout=10)
 
                 # Pillow で実体読み込み（ここで壊れた画像だと例外）
@@ -384,8 +426,12 @@ class GPRScript(scripts.Script):
                 else:
                     best = _find_best_sdxl_size(img.width, img.height)
                     if best:
-                        p.width, p.height = best
-                        print(f"[GPR] Auto SDXL Resize → {p.width}x{p.height}")
+                        # --- apply scale & round to 64 ---
+                        scaled_w = _round64(best[0] * scale)
+                        scaled_h = _round64(best[1] * scale)
+                        p.width, p.height = scaled_w, scaled_h
+                        print(f"[GPR] Auto SDXL Resize × {scale} → {p.width}x{p.height}")
+
                     else:
                         print(f"[GPR] No suitable SDXL preset for {img.width}x{img.height}, keep original")
 
@@ -431,76 +477,39 @@ class GPRScript(scripts.Script):
                 except:
                     pass
 
-                # === 次サイクルで必ず新しい候補を取得させる ===
-                self._cached_post_info = None
-                self._cached_image_url = ""
-                self._cached_tags_str = ""
+                # === このpに紐づくキャッシュを無効化して、次の before で再取得させる ===
+                try:
+                    p._gpr_cached_post_info = None
+                    p._gpr_cached_image_url = None
+                    p._gpr_cached_tags_str = ""
+                except Exception:
+                    pass
 
-                return  # ←今回はこの生成をスキップ。次ループで再取得
+                return  # ←今回はこの生成をスキップ。次の before で再取得                    
 
-        # Include Tags をメタデータに保存
+        # ---- メタデータ初回書き込み ----
         try:
             include_raw = include_box if include_box else ""
-            if include_raw:
-                if not hasattr(p, "extra_generation_params"):
-                    p.extra_generation_params = {}
+            if not hasattr(p, "extra_generation_params"):
+                p.extra_generation_params = {}
+
+            # Include Tags（未設定時のみ）
+            if include_raw and "GPR Include Tags" not in p.extra_generation_params:
                 p.extra_generation_params["GPR Include Tags"] = include_raw.replace('"', '')
         except Exception as e:
             print("[GPR] Failed to insert include tags metadata:", e)
 
-        # メタデータに投稿ページURLを保存
+        # ---- POST URL をメタデータへ（未設定時のみ）----
         try:
             if post_info:
-
-                # --- POST ページ URL（引用符除去） ---
-                post_url = str(self._cached_post_info).replace('"', '')
+                post_url = str(post_info).replace('"', '')  
 
                 if not hasattr(p, "extra_generation_params"):
                     p.extra_generation_params = {}
 
-                p.extra_generation_params["GPR Post URL"] = post_url
-
-                # --- 画像取得用 file_url の併記（引用符除去） ---
-                img_url = (self._cached_image_url or "").replace('"', '')
-                p.extra_generation_params["GPR Image URL"] = img_url
-        
-                # -----------------------------------------
-                # 末尾：使用済みURL登録（前方から移動）
-                # -----------------------------------------
-                try:
-                    register_used_post(post_info)
-                except Exception as e:
-                    print("[GPR] register_used_post failed:", e)
-
-                # -----------------------------------------
-                # Auto stop （前方から移動）
-                # -----------------------------------------
-                if is_all_used():
-                    try:
-                        p.batch_count = 1
-                        print(f"[GPR] All {total_count} posts used. Auto stop next cycle.")
-                    except:
-                        pass
-
-                # -----------------------------------------
-                # 条件付きキャッシュクリア
-                # 「使用済み登録されなかったURLのみ保持」
-                #   → register_used_post が成功していれば削除する
-                # -----------------------------------------
-                if self._cached_image_url:
-                    pid_match = re.search(r'id=(\d+)', str(post_info))
-                    pid = pid_match.group(1) if pid_match else None
-                    if pid and pid in used_post_ids:
-                        # normally clear
-                        self._cached_tags_str = ""
-                        self._cached_image_url = ""
-                        self._cached_post_info = None
-                        print("[GPR] Cache cleared (registered)")
-                    else:
-                        # keep cache because URL not registered
-                        print("[GPR] Cache kept (unregistered)")
-
-    
+                # Post URL（未設定時のみ）
+                if "GPR Post URL" not in p.extra_generation_params:
+                    p.extra_generation_params["GPR Post URL"] = post_url
         except Exception as e:
             print("[GPR] Metadata insert failed:", e)
 

@@ -6,7 +6,7 @@ include指定はカンマ区切りで、_のスペース変換はしていない
 コードはAIに丸投げして生成しました。
 
 履歴
-v1.0.0：or検索対応。{A|B|C}でAかBかCのどれかを含む。
+・　v1.0.0：or検索対応。{A|B|C}でAかBかCのどれかを含む。
 ・（）があるタグに対応。それに伴いor指定を（）から｛｝に変更。{a|b|c}。
 
 I modified the script so that enabling “Generate Forever” automatically adds the required text to the prompt.  

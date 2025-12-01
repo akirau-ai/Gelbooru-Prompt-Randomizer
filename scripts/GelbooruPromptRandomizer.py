@@ -300,12 +300,28 @@ class GPRScript(scripts.Script):
         # ==== タグ条件変更検知（このpに紐づくキャッシュだけ無効化）====
         cur_inc = include_box or ""
         cur_exc = exclude_box or ""
+
+        # ----------------------------------------------
+        # ★ 新サイクル開始時の fatal error リセット
+        #   （＝ generate ボタン押下 → p が新しくなる）
+        # ----------------------------------------------
+        if self._fatal_api_error:
+            print("[GPR] Reset fatal API error (new cycle)")
+            self._fatal_api_error = False
+
         if cur_inc != self._last_include or cur_exc != self._last_exclude:
             print("[GPR] Tag conditions changed → cache cleared for this cycle")
             if hasattr(p, "_gpr_cached_post_info"):
                 p._gpr_cached_post_info = None
                 p._gpr_cached_image_url = None
                 p._gpr_cached_tags_str = ""
+    
+            # ----------------------------------------------
+            # ★ タグ条件が変わった時点でも fatal error をリセット
+            # ----------------------------------------------
+            if self._fatal_api_error:
+                print("[GPR] Reset fatal API error (tag changed)")
+                self._fatal_api_error = False
 
         self._last_include = cur_inc
         self._last_exclude = cur_exc
